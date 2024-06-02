@@ -11,6 +11,8 @@ which'll be better conditioned due to
 the smoothness benefits of training
 a VAE
 """
+import argparse
+
 import torch
 import torch.nn as nn
 from torchvision import datasets
@@ -18,20 +20,56 @@ from torchvision.transforms import ToTensor
 from torch.utils.data import DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
+import pydantic
 
-# Set seeds
-SEED = 42
+class VAEConfig(pydantic.BaseModel):
+  randomSeed : int = 42
+  latentDims : int = 50
+  lr : float = 1e-5
+  bs : int = 256
+  numEpochs : int = 30
+  numHiddenLayers : int = 2
+  hiddenDim : int = 256
+
+# Parse in the config file; this
+# contains most of the variations
+# in the model
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", type=str)
+args = parser.parse_args()
+
+if args.config is not None:
+  with open(args.config, "r") as configFile:
+    config = VAEConfig.model_validate_json(configFile.read())
+
+else:
+  config = VAEConfig()
+
+print(config)
+
+# Pull out config
+SEED = config.randomSeed
+LATENT_DIMS = config.latentDims
+LR = config.lr
+BS = config.bs
+NUM_EPOCHS = config.numEpochs
+NUM_HIDDEN_LAYERS = config.numHiddenLayers
+HIDDEN_DIM = config.hiddenDim
+
+# The hidden activation really doesn't matter,
+# but I'm gonna just use Mish here. GELU's good,
+# so is RELU
+ACT = nn.GELU
+
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 mnistTrain = datasets.MNIST(root="data", train=True, download=True, transform=ToTensor())
 mnistTest = datasets.MNIST(root="data", train=False, download=True, transform=ToTensor())
 
-# GeLU seems to be better than ReLU on a lot of cases
-ACT = nn.GELU 
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Reduce f32 precision
 torch.set_float32_matmul_precision('high')
 
 """
@@ -53,8 +91,6 @@ I'll make both the encoder and decoder an MLP,
 just so there's less tweaking needed on my end
 than something fancy like a U-Net.
 """
-LATENT_DIMS = 50
-
 class MLPBlock(nn.Module):
   """
   A simple residual hidden
@@ -79,22 +115,22 @@ class MLPBlock(nn.Module):
 
 encoder = torch.compile(nn.Sequential(
   nn.Flatten(),
-  nn.Linear(28 * 28, 256),
+  nn.Linear(28 * 28, HIDDEN_DIM),
   ACT(),
-  MLPBlock(256),
-  MLPBlock(256),
+  *[MLPBlock(HIDDEN_DIM) for _ in range(NUM_HIDDEN_LAYERS)],
+  torch.nn.Dropout(0.5),
   # The output is the mean
   # and log variance concatted,
   # just break them after
-  nn.Linear(256, LATENT_DIMS * 2)
+  nn.Linear(HIDDEN_DIM, LATENT_DIMS * 2)
 )).to(device)
 
 decoder = torch.compile(nn.Sequential(
-  nn.Linear(LATENT_DIMS, 256),
+  nn.Linear(LATENT_DIMS, HIDDEN_DIM),
   ACT(),
-  MLPBlock(256),
-  MLPBlock(256),
-  nn.Linear(256, 28 * 28),
+  *[MLPBlock(HIDDEN_DIM) for _ in range(NUM_HIDDEN_LAYERS)],
+  torch.nn.Dropout(0.5),
+  nn.Linear(HIDDEN_DIM, 28 * 28),
   nn.Sigmoid()
 )).to(device)
 
@@ -128,9 +164,6 @@ def sampleFromMeanVar(mean, var, decoder):
   # decoder
   return decoder(mean + scaledNoise)
 
-LR = 1e-5
-BS = 256
-NUM_EPOCHS = 30
 optimizer = torch.optim.Adam(list(encoder.parameters()) + list(decoder.parameters()), lr=LR)
 
 def train():
@@ -156,7 +189,7 @@ def train():
       # prior and the posterior
 
       reconstructionLoss = nn.functional.mse_loss(XSampled, X.flatten(start_dim=1))
-      klDivergence = torch.mean(-0.5 * torch.sum(1 + torch.log(var) - mean.pow(2) - var))
+      klDivergence = -0.5 * torch.mean(1 + torch.log(var) - mean.pow(2) - var)
 
       loss = reconstructionLoss + klDivergence
       # Backpropagate

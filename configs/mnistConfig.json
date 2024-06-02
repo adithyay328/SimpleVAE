@@ -1,0 +1,9 @@
+{
+"randomSeed": 42,
+"latentDims" : 50,
+"lr" : 1e-5,
+"bs" : 256,
+"numEpochs" : 30,
+"numHiddenLayers" : 2,
+"hiddenDim" : 256
+}
