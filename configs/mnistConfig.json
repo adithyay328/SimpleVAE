@@ -1,9 +1,13 @@
 {
 "randomSeed": 42,
-"latentDims" : 50,
+"latentDims" : 30,
 "lr" : 1e-5,
 "bs" : 256,
-"numEpochs" : 30,
-"numHiddenLayers" : 2,
-"hiddenDim" : 256
+"numEpochs" : 15,
+"numHiddenLayers" : 1,
+"hiddenDim" : 128,
+"dropoutFrac" : 0.4,
+"l2Decay" : 0,
+"blockNormType" : "layer",
+"klWeight" : 1.0
 }

@@ -30,6 +30,10 @@ class VAEConfig(pydantic.BaseModel):
   numEpochs : int = 30
   numHiddenLayers : int = 2
   hiddenDim : int = 256
+  droputFrac : float = 0.3
+  l2Decay : float = 0.0
+  blockNormType : str = "layer"
+  klWeight : float = 0.1
 
 # Parse in the config file; this
 # contains most of the variations
@@ -55,6 +59,10 @@ BS = config.bs
 NUM_EPOCHS = config.numEpochs
 NUM_HIDDEN_LAYERS = config.numHiddenLayers
 HIDDEN_DIM = config.hiddenDim
+DROP_FRAC = config.droputFrac
+L2_DECAY = config.l2Decay
+BLOCK_NORM_TYPE = config.blockNormType
+KL_WEIGHT = config.klWeight
 
 # The hidden activation really doesn't matter,
 # but I'm gonna just use Mish here. GELU's good,
@@ -96,18 +104,26 @@ class MLPBlock(nn.Module):
   A simple residual hidden
   block in an MLP.
   """
-  def __init__(self, inDims : int, outDims : int = None):
+  def __init__(self, inDims : int, outDims : int = None, dropoutFrac : float = 0.0, layerNormType : str = "layer"):
     super().__init__()
 
     outDims = outDims if outDims is not None else inDims
 
     self.seq = nn.Sequential(
       nn.Linear(inDims, outDims),
-      ACT()
+      ACT(),
+      nn.Dropout(dropoutFrac)
     )
 
+    if layerNormType == "layer":
+      self.norm = nn.LayerNorm(outDims)
+
   def forward(self, X):
-    return self.seq(X) + X
+    prevOut = self.seq(X) + X
+    if "norm" in self.__dict__:
+      return self.norm(prevOut)
+    else:
+      return prevOut
 
 # Uncomment to disable compilation of models;
 # makes debug messages easier to read.
@@ -117,8 +133,8 @@ encoder = torch.compile(nn.Sequential(
   nn.Flatten(),
   nn.Linear(28 * 28, HIDDEN_DIM),
   ACT(),
-  *[MLPBlock(HIDDEN_DIM) for _ in range(NUM_HIDDEN_LAYERS)],
-  torch.nn.Dropout(0.5),
+  nn.Dropout(DROP_FRAC),
+  *[MLPBlock(HIDDEN_DIM, dropoutFrac = DROP_FRAC, layerNormType = BLOCK_NORM_TYPE) for _ in range(NUM_HIDDEN_LAYERS)],
   # The output is the mean
   # and log variance concatted,
   # just break them after
@@ -128,8 +144,8 @@ encoder = torch.compile(nn.Sequential(
 decoder = torch.compile(nn.Sequential(
   nn.Linear(LATENT_DIMS, HIDDEN_DIM),
   ACT(),
-  *[MLPBlock(HIDDEN_DIM) for _ in range(NUM_HIDDEN_LAYERS)],
-  torch.nn.Dropout(0.5),
+  nn.Dropout(DROP_FRAC),
+  *[MLPBlock(HIDDEN_DIM, dropoutFrac = DROP_FRAC, layerNormType = BLOCK_NORM_TYPE) for _ in range(NUM_HIDDEN_LAYERS)],
   nn.Linear(HIDDEN_DIM, 28 * 28),
   nn.Sigmoid()
 )).to(device)
@@ -164,7 +180,7 @@ def sampleFromMeanVar(mean, var, decoder):
   # decoder
   return decoder(mean + scaledNoise)
 
-optimizer = torch.optim.Adam(list(encoder.parameters()) + list(decoder.parameters()), lr=LR)
+optimizer = torch.optim.Adam(list(encoder.parameters()) + list(decoder.parameters()), lr=LR, weight_decay=L2_DECAY)
 
 def train():
   crossEpochTrainLosses = []
@@ -173,6 +189,10 @@ def train():
   for epochIdx in range(NUM_EPOCHS):
     currEpochTrainLosses = []
     currEpochTestLosses = []
+
+    # Set model to train mode
+    encoder.train()
+    decoder.train()
 
     for batchIdx, batch in enumerate(DataLoader(mnistTrain, batch_size=BS, shuffle=True)):
       X, _ = batch
@@ -191,17 +211,17 @@ def train():
       reconstructionLoss = nn.functional.mse_loss(XSampled, X.flatten(start_dim=1))
       klDivergence = -0.5 * torch.mean(1 + torch.log(var) - mean.pow(2) - var)
 
-      loss = reconstructionLoss + klDivergence
+      loss = reconstructionLoss + KL_WEIGHT * klDivergence
       # Backpropagate
       loss.backward()
       # Optimize
       optimizer.step()
-      # Print the loss
-      print(f"Epoch: {epochIdx}, Batch: {batchIdx}, Loss: {loss}")
 
       currEpochTrainLosses.append(loss.item())
 
     # Now, run testing iterations
+    encoder.eval()
+    decoder.eval()
     with torch.no_grad():
       for batchIdx, batch in enumerate(DataLoader(mnistTest, batch_size=BS, shuffle=True)):
         X, _ = batch
@@ -210,18 +230,23 @@ def train():
         mean, var = getMeanVarsFromInput(X, encoder)
         # Sample from the mean and variance
         XSampled = sampleFromMeanVar(mean, var, decoder)
+
         # Compute the loss
         # The loss is the reconstruction loss
         # plus the KL divergence between the
         # prior and the posterior
         reconstructionLoss = nn.functional.mse_loss(XSampled, X.flatten(start_dim=1))
-        klDivergence = torch.mean(-0.5 * torch.sum(1 + torch.log(var) - mean.pow(2) - var))
-        loss = reconstructionLoss + klDivergence
+        klDivergence = -0.5 * torch.mean(1 + torch.log(var) - mean.pow(2) - var)
+
+        loss = reconstructionLoss + KL_WEIGHT * klDivergence
         currEpochTestLosses.append(loss.item())
 
     # Add means to cross epoch
     crossEpochTrainLosses.append(np.mean(currEpochTrainLosses))
     crossEpochTestLosses.append(np.mean(currEpochTestLosses))
+
+    # Print epoch means
+    print(f"Epoch {epochIdx} Train Loss: {crossEpochTrainLosses[-1]} Test Loss: {crossEpochTestLosses[-1]}")
 
   
   # Plot losses
